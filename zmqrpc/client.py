@@ -5,7 +5,6 @@ client.py: Client class to export a class to an zmqrpc queue or client.
 import zmq, time
 import os, sys, traceback
 
-from bson       import BSON   
 from errors     import *
 from serialize  import get_serializer    
 
