@@ -3,7 +3,7 @@ Support for multiple serialization methods.
 """
 
 import msgpack, simplejson, pickle
-from error import CannotFindSerializer
+from errors import CannotFindSerializer
 
 def get_serializer(type="msgpack"):
 	type = type.capitalize()
@@ -15,7 +15,7 @@ def get_serializer(type="msgpack"):
 		raise CannotFindSerializer()
 
 class Serializer(object):
-	
+	# TODO
 	def pack(self, payload):
 		pass
 	
@@ -23,7 +23,7 @@ class Serializer(object):
 		pass
 
 class PickleSerializer(Serializer):
-
+	# TODO
 	def pack(self, payload):
 		pass
 	
@@ -31,7 +31,7 @@ class PickleSerializer(Serializer):
 		pass
 
 class JsonSerializer(Serializer):
-
+	# TODO
 	def pack(self, payload):
 		pass
 	

@@ -1,6 +1,5 @@
 """ Provides an RPC interface for a class via zmq. """ 
 
-__debug__        = False
 __version__      = "0.2"
 __url__          = ''
 __author__       = "Geoff Watts, Alex Michael"
