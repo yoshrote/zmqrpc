@@ -1,131 +1,246 @@
 """
-server: Implementing ZMQRPCServer class to export a user class via zmqrpc to ZMQRPC clients, and to arrange queued calls to server threads.
+server.py: Implements the ZMQRPCServer class. Inherit this class to 
+transform your class into a multi-threaded 0MQ server.
 """
 
-import sys
+import sys, time
 if sys.version < '2.6':
     sys.exit('ERROR: Sorry, python 2.6 is required for the way this module uses threading.')
 
-import zmq
-from bson import BSON   
-import threading
-import os, sys, traceback
-from zmqrpc import ZMQRPCError, ZMQRPCRemoteError
+import zmq, threading, os, sys, traceback
+
+from errors    import BadConfig, NotExported, CannotExport
+from serialize import get_serializer
+
+FORBIDDEN_METHODS = [
+    '__init__',
+    'serve_forever', 
+    'shutdown'
+]
+
+def export(method):
+    """ Decorate instance methods with this decorator to export them
+    as RPC methods. """
+    if method.__name__ in FORBIDDEN_METHODS:
+        raise CannotExport("'%s()' cannot be exported." % method)
+    setattr(method, 'exported', True)
+    return method
 
 
-LISTEN=0
-CONNECT=1
+# ======================= Worker ======================== #
+
+
+class Worker(threading.Thread):
+    """ Server worker thread. """
+    def __init__(self, name, serv):
+        super(Worker, self).__init__()
+        self.name       = name
+        self.serv       = serv
+        self.worker_url = serv.url_worker_sock
+        self.context    = serv.context
+        self.serializer = get_serializer(serv.serializer)
+        self.socket     = self.context.socket(zmq.REP)
+        self.stop_flag  = threading.Event()
+        self._debug     = self.serv._debug
+        
+        # Stats.
+        self.op_counter   = {}
+        self.last_success = {}
+        self.last_fail    = {}
+
+    def stop(self):
+        """ Sets stop flag and closes 0mq socket. """
+        print "closing worker socket"
+        self.stop_flag.set()
+        self.socket.close()
+
+    def stopped(self):
+        """ Checks stop flag. """
+        return self.stop_flag.isSet()
+    
+    def status(self):
+        return {
+            'health': 'ok',
+            'ops'   : self.op_counter,
+            'last_success': self.last_success,
+            'last_fail'   : self.last_fail
+        }
+    
+    def inc_success(self, method):
+        if not method in self.op_counter:
+            self.op_counter[method] = {'success': 0, 'fail': 0}
+        self.op_counter[method]['success'] += 1
+    
+    def inc_fail(self, method):
+        if not method in self.op_counter:
+            self.op_counter[method] = {'success': 0, 'fail': 0}
+        self.op_counter[method]['fail'] += 1
+
+    def run(self):
+        """ Run worker. """
+        self.socket.connect(self.worker_url)
+        serv_name = self.serv.__class__.__name__
+
+        while not self.stopped():
+            payload = None
+            try:
+                payload = self.socket.recv()
+                if self._debug:
+                    print "%s: received request" % self.name
+            except zmq.ZMQError as e:
+                if self._debug:
+                    print "%s: error encountered during recv: %s" % (self.name, str(e))
+                self.stop()
+                continue
+            
+            payload = self.serializer.unpack(payload)
+            method  = str(payload['method'])
+            args    = payload.get('args', [])
+            kwargs  = self._str_keys(payload.get('kwargs', {}))
+            
+            try:
+                # Not defined method.
+                if not hasattr(self.serv, method):
+                    raise NotExported("'%s()' is not exported." % method)
+
+                # Get method.
+                fn = getattr(self.serv, method)
+                
+                # Check if it is exported.
+                if not hasattr(fn, 'exported') or not fn.exported:
+                    raise NotExported("'%s()' is not exported." % method)
+                
+                # Execute.
+                result = fn(*args, **kwargs)
+                payload = {
+                    'success': True,
+                    'result' : result,
+                }
+                payload = self.serializer.pack(payload)
+                self.socket.send(payload)
+                self.inc_success(method)
+                self.last_success['method'] = method
+                self.last_success['time'] = time.time()
+                if self._debug:
+                    print "%s: send reply success" % self.name
+            except Exception as e:
+                if self._debug:
+                    print "%s: error occured while serving request: %s" % (self.name, str(e))
+                trace   = traceback.format_exc()
+                payload = {
+                    'success': False,
+                    'result' : None,
+                    'exc': {
+                        'trace': trace,
+                        'msg'  : str(e),
+                        'cls'  : e.__class__.__name__
+                    }
+                }
+                payload = self.serializer.pack(payload)
+                self.socket.send(payload)
+                self.inc_fail(method)
+                self.last_fail['method'] = method
+                self.last_fail['time'] = time.time()
+
+    def _str_keys(self, d):
+        """ Convert dict keys to str. """
+        kwargs = {}
+        for k, v in d.iteritems():
+            kwargs[str(k)] = v
+        return kwargs
+
+
+# ======================= ZMQRPCServer ======================== #
+
 
 class ZMQRPCServer(object):
-    def _thread(self,context,worker_id,import_class,pid,serverid,counters,methods,target,stype,worker_args):
-        """
-        Worker thread for zmqrpc server - binds to zmq socket (target) and works ZMQRPCServer import_class.
-        Instantiated by work() threading
-        Handles BSON in/out, zmq REP to zmq QUEUE or REQ
-        """
-        socket = self.context.socket(zmq.REP)
-        job_count = 0
-        if stype == LISTEN:
-            socket.bind(target)
-        else:
-            socket.connect(target)
-
-        if worker_args:
-            nuclass = import_class(**worker_args)
-        else:
-            nuclass = import_class()
+    """
+    Inherit this class to transform your class into a multi-threaded 0MQ server.
+    """
+    def __init__(self, bind="tcp://127.0.0.1:5000", serializer="msgpack"):
+        """ Init the RPC server. This method _must_ be called from
+        the child class if it overrides the __init__ method. """
+        if not bind:
+            raise BadConfig("Bind address is not defined.")
         
-        while True:
-            sockin = socket.recv()
-            message = BSON(sockin).decode()
-            result = None
-            fail = None
-            tb = None
-            method = str(message['method'])
-            args = message.get('args',[])
-            if self.export and (not method in self.export):
-                tb = "NameError: name '"+method+"' is not exported in ZMQRPC class '"+import_class.__name__+"'"
-                socket.send(BSON.encode({'fail':True,'result':None,'runner':None,'traceback':tb}))
-                return
-                
+        # Set to true to get verbose output for what's happening.
+        self._debug = False
 
-            # Convert kwargs from unicode strings to 8bit strings
-            
-            if method == '__threadstatus__':
-                x = threading.current_thread()
-                socket.send(BSON.encode({'runner':None,'traceback':None,'fail':False,'result':{'id':serverid+':'+str(pid)+':'+str(x.name),'alive':x.is_alive(),'job_count':counters.get(x.name,0),'last_method':methods.get(x.name,''),}}))   
-            else:
-                try:
-                    kwargs = {}
-                    for (k,v) in message.get('kwargs',{}).iteritems():
-                        kwargs[str(k)] = v
-
-                    job_count+=1
-                    counters[threading.currentThread().name] = job_count
-                    methods[threading.currentThread().name] = method
-                    runner = {'job_count':job_count,'thread':threading.currentThread().name,'method':import_class.__name__+'.'+method,}
-                    
-                    # Find the method in the module, run it.
-                    try:
-                        if hasattr(nuclass,method):
-                            result = getattr(nuclass,method)(*args,**kwargs)
-                            fail = False
-                        else:
-                            fail = True
-                            tb = "NameError: name '"+method+"' is not defined in ZMQRPC class '"+import_class.__name__+"'"
-                    except:
-                        etype, evalue, etb = sys.exc_info()
-                        fail = True
-                        tb = "\n".join(traceback.format_exception(etype, evalue, etb))
-                    socket.send(BSON.encode({'fail':fail,'result':result,'runner':runner,'traceback':tb}))
-                except:
-                    etype, evalue, etb = sys.exc_info()
-                    fail = True
-                    tb = "\n".join(traceback.format_exception(etype, evalue, etb))
-                    socket.send(BSON.encode({'fail':fail,'result':None,'runner':None,'traceback':tb}))
-
-
-    def __init__(self,import_class,export=None):
-        """
-        Instantiate this class with your class to export via zmqrpc
-        """
-        self.iclass = import_class
-        self.pid = os.getpid()
-        self.serverid = os.uname()[1]
+        self.serializer = serializer
+        self.url_worker_sock = "inproc://workers"
+        self.url_client_sock = bind
+        
         self.context = zmq.Context(1)
-        self.export = export
-
-    def work(self,workers=1,target="inproc://workers",stype=CONNECT,worker_args={}):
-        """
-        Call to spawn serverthreads that will then work forever.
-        stype: socket type, either zmqrpc.server.CONNECT or zmqrpc.server.LISTEN
-        target: zmq socket (eg: 'tcp://127.0.0.1:5000')
-        workers: number of worker threads to spwan
-        """
-        counters = {}
-        methods = {}
-        for i in range(0,workers):
-            thread = threading.Thread(target=self._thread, name='zmqrpc-'+str(i), args=(self.context,i,self.iclass,self.pid,self.serverid,counters,methods,target,stype,worker_args))
-            thread.start()
-
-            
-    def queue(self,listen,bind='inproc://workers',thread=False):
-        """
-        Call to start a zmq queue device to disatch zmqrpc work.
-        listen: zmq socket to listen on for CLIENTS (eg: 'tcp://127.0.0.1:5 000')
-        target: zmq socket to listen on for worker threads (eg: 'tcp://127.0.0.1:6000')
-        workers: number of worker threads to spwan
-        """
-        def q(listen,worker_target):
-            self.workers = self.context.socket(zmq.XREQ)
-            self.workers.bind(worker_target);
-
-            self.clients = self.context.socket(zmq.XREP)
-            self.clients.bind(listen) 
-            zmq.device(zmq.QUEUE, self.clients, self.workers)
-        if thread:
-            thread = threading.Thread(target=q, name='zmqrpc-queue', args=(listen,bind ))
-            thread.start()
-        else:
-            q(listen,bind)
         
+        # Socket to talk to clients
+        if self._debug:
+            print "binding client socket at %s" % self.url_client_sock
+        self.client_sock = self.context.socket(zmq.ROUTER)
+        self.client_sock.bind(self.url_client_sock)
+        
+        # Socket to talk to workers
+        if self._debug:
+            print "binding workers socket at %s" % self.url_worker_sock
+        self.worker_sock = self.context.socket(zmq.DEALER)
+        self.worker_sock.bind(self.url_worker_sock) 
+
+        self.workers = []
+
+    def serve_forever(self, workers=2):
+        """ Start server and serve. """
+        if self._debug:
+            print "spawning %s workers" % str(workers)
+        for i in range(workers):
+            name   = "worker_%s" % str(i)
+            worker = Worker(name, self)
+            self.workers.append(worker)
+            worker.start()
+            if self._debug:
+                print "spawned %s" % name
+        try:
+            zmq.device(zmq.QUEUE, self.client_sock, self.worker_sock)
+            if self._debug:
+                print "this shouldn't be happening. shutting down."
+            self.shutdown()
+        except KeyboardInterrupt:
+            if self._debug:
+                print "keyboard interrupt"
+            self.shutdown()
+        
+    def shutdown(self):
+        """ Shut down the server and running threads. """
+        if self._debug:
+            print "closing dealer client socket"
+        
+        self.client_sock.close()
+        
+        if self._debug:
+            print "closing dealer worker socket"
+        
+        self.worker_sock.close()
+        
+        if self._debug:
+            print "terminating dealer 0mq context"
+        
+        self.context.term()
+        
+        if self._debug:
+            print "waiting for workers to exit"
+        
+        for w in self.workers:
+            w.join()
+        print "bye"
+        
+    # Pre-defined methods.
+
+    @export
+    def __ping__(self):
+        """ Check connectivity. """
+        return "pong"
+    
+    @export
+    def __serverstatus__(self):
+        status = {}
+        for t in self.workers:
+            status[t.name] = t.status()
+        return status

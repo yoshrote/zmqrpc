@@ -1,119 +1,90 @@
-"""client: client class to export a class to an zmqrpc queue or client."""
-import zmq
-from bson import BSON   
-import os, sys, traceback
-import time
+"""
+client.py: Client class to export a class to an zmqrpc queue or client.
+"""
 
-from zmqrpc import ZMQRPCError, ZMQRPCRemoteError
+import zmq, time
+import os, sys, traceback
+
+from bson       import BSON   
+from errors     import *
+from serialize  import get_serializer    
+
+
+# ====================== ZMQRPC ======================= #
+
 
 class ZMQRPC(object):
     """
-    ZMQRPC: client class to export a class to an zmqrpc queue or client.
+    ZMQRPC: Client class to export a class to a zmqrpc queue or client.
     """
-    def __init__(self,target,timeout=30):
-        """
-        Instantiate this class with a zmq target (eg 'tcp://127.0.0.1:5000') and a timeout (in seconds) for method calls.
-        Then call zmqrpc server exported methods from the class.
-        """
-        
-        self._context = zmq.Context()
-        self._zmqsocket = self._context.socket(zmq.REQ)
-        # Connect to everything, or just one
-        if isinstance(target,list):
-            for t in target:
-                self._zmqsocket.connect(target)
-        else:
-            self._zmqsocket.connect(target)
-        self._socket = target
-        self._pollin = zmq.Poller()
-        self._pollin.register(self._zmqsocket,zmq.POLLIN)
-        self._pollout = zmq.Poller()
-        self._pollout.register(self._zmqsocket,zmq.POLLOUT)
-        self._timeout = timeout
-        
-        self._lastrun = None
+    def __init__(self, server_url, timeout=10, serializer='msgpack'):
+        """ Instantiate this class with a zmq url (eg 'tcp://127.0.0.1:5000') 
+        and a timeout (in seconds) for method calls. Then call zmqrpc server 
+        exported methods from the class. """
+        if not server_url:
+            raise BadConfig("Server url is not defined.")
+        if timeout < 0:
+            raise BadConfig("Illegal timeout value.")
+        self.context    = zmq.Context()
+        self.zmqsocket  = self.context.socket(zmq.REQ)
+        self.server_url = server_url
 
-    def _dorequest(self,msg,timeout=5):
-        """
-        _dorequest: Set up a BSON string and send zmq REQ to ZMQRPC target
-        """
-        # Set up bson message
-        bson = BSON.encode(msg)
+        self.zmqsocket.connect(self.server_url)
+           
+        self.serializer = get_serializer(serializer)
         
-        # Send...
+        self.pollin = zmq.Poller()
+        self.pollin.register(self.zmqsocket, zmq.POLLIN)
+        
+        self.pollout = zmq.Poller()
+        self.pollout.register(self.zmqsocket, zmq.POLLOUT)
+        
+        # In millis.
+        self.timeout = timeout * 1000
+
+    def _request(self, payload):
+        """ Send a zmq request to the server url. """
+        payload = self.serializer.pack(payload)
+        
         try:
-            self._pollout.poll(timeout=timeout*1000) # Poll for outbound send, then send
-            self._zmqsocket.send(bson,flags=zmq.NOBLOCK)
-        except:
-            raise ZMQRPCError('Request failure')
+            self.pollout.poll(timeout=self.timeout) 
+            self.zmqsocket.send(payload, flags=zmq.NOBLOCK)
+        except Exception as e:
+            raise RequestFailure('Cannot send request. Error was: ' + str(e))
 
-        # Poll for inbound then rx
-        try:        
-            for i in range(0,timeout*100):
-                if len(self._pollin.poll(timeout=1)) > 0:
-                    break
-                time.sleep(0.01)
-            msg_in = self._zmqsocket.recv(flags=zmq.NOBLOCK)
-        
-        except:
-            raise ZMQRPCError('Response timeout')
-
+        msg_in = None
+        try:
+            socks = dict(self.pollin.poll(timeout=self.timeout))
+            if socks and socks.get(self.zmqsocket) == zmq.POLLIN:
+                msg_in = self.zmqsocket.recv(flags=zmq.NOBLOCK)
+        except Exception as e:
+            raise RequestFailure('Response timeout. Error was: ' + str(e))
         
         if msg_in == None:
-            raise ZMQRPCError('No response')
-    
-        result = BSON(msg_in).decode()
+            raise RequestFailure('No response.')
         
-        self._lastrun = result.get('runner')
-        
-        return result
-    
-    
-    def _debug_call(self,name,*args,**kwargs):
-        """
-        _debug_call: Convenience method to call _dorequest with pre-filled dict with method name, args, kwargs and timeout
-        """
-        return self._dorequest({'method':name,'args':args,'kwargs':kwargs},timeout=self._timeout)
-               
-    def __serverstatus__(self,max_nodes=1000):
-        """
-        __serverstatus__: Slightly hackish method to retreive threadstatus from all listening threads on a zmqrpc queue
-        """
-        results = {}
-        try:
-            for r in range(0,max_nodes):
-                res = self._dorequest({'method':'__threadstatus__'},timeout=self._timeout)[u'result']
-                id = res[u'id']
-                if results.has_key(id): break
-                del res[u'id']
-                results[id] = res
-        except:
-            raise ZMQRPCError('Error finding server threads')
-        return results
-            
-            
-         
-    class RPC(object):
-        """
-        RPC: zmqrpc Remote procedure call class - encapsulates method calls to imported class
-        """
-
-        def __init__(self,name,fn,timeout,target):
-            self._name = name
-            self._fn = fn
-            self._timeout = timeout
-            self._socket = target
-            
-        def __call__(self,*args,**kwargs):
-            result = self._fn({'method':self._name,'args':args,'kwargs':kwargs},timeout=self._timeout)
-            if result['fail']:
-                raise ZMQRPCRemoteError(result['traceback']) #+"  RUNNER:"+str(result['runner']))
+        return self.serializer.unpack(msg_in)
+                    
+    def __getattr__(self, name):
+        """ Return a wrapper function, encapsulating the rpc call. """
+        def rpc_wrapper(*args, **kwargs):
+            payload = {
+                'method': name,
+                'args'  : args,
+                'kwargs': kwargs
+            }
+            result = self._request(payload)
+            if 'success' not in result:
+                raise InvalidResponse("Cannot find 'success' attr.") 
+            if not result['success']:
+                exc_class  = result['exc']['cls']
+                exc_msg    = result['exc']['msg']
+                errors_mod = __import__('errors')
+                if hasattr(errors_mod, exc_class):
+                    raise getattr(errors_mod, exc_class)(exc_msg)
+                else:
+                    raise RemoteError(exc_msg)
             else:
                 return result['result']
-        def __repr__(self):
-            return '<zmqrpc method '+self._name+' to zmq socket '+self._socket+'>'
-            
-        
-    def __getattr__(self,name):
-            return self.RPC(name,self._dorequest,timeout=self._timeout,target=self._socket)
+        return rpc_wrapper
  
