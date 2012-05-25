@@ -23,20 +23,20 @@ class Serializer(object):
         pass
 
 class PickleSerializer(Serializer):
-    # TODO
+
     def pack(self, payload):
-        pass
+        pickle.dumps(payload)
     
     def unpack(self, payload):
-        pass
+        pickle.loads(payload)
 
 class JsonSerializer(Serializer):
-    # TODO
+
     def pack(self, payload):
-        pass
+        simplejson.dumps(payload)
     
     def unpack(self, payload):
-        pass
+        simplejson.loads(payload)
 
 class MsgpackSerializer(Serializer):
 
